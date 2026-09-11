@@ -16,6 +16,19 @@ CHAT_MODEL = os.environ.get("AURA_CHAT_MODEL", "databricks-claude-sonnet-4-5")
 TEMPERATURE = float(os.environ.get("AURA_TEMPERATURE", "0.0"))
 MAX_TOKENS = int(os.environ.get("AURA_MAX_TOKENS", "2048"))
 
+# Embedding endpoint. Which of these a workspace actually serves varies, so we
+# probe in order rather than hardcode one and fail at query time. Setting
+# AURA_EMBED_MODEL skips the probe entirely.
+EMBED_MODEL = os.environ.get("AURA_EMBED_MODEL", "").strip()
+EMBED_CANDIDATES: tuple[str, ...] = (
+    "databricks-gte-large-en",
+    "databricks-bge-large-en",
+)
+
+# Databricks embedding endpoints reject oversized input arrays. 32 is well
+# inside every published limit and still amortises the round trip.
+EMBED_BATCH = int(os.environ.get("AURA_EMBED_BATCH", "32"))
+
 _CREDENTIAL_HELP = (
     "No Databricks credentials found. In a Databricks App these are injected "
     "automatically (DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET); "
