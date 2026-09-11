@@ -1,0 +1,14 @@
+# Databricks Apps deployment descriptor.
+#
+# Apps must bind 0.0.0.0 on the port given in DATABRICKS_APP_PORT. Credentials
+# are injected as an OAuth service principal (DATABRICKS_CLIENT_ID /
+# DATABRICKS_CLIENT_SECRET) and picked up automatically by databricks-sdk —
+# no token belongs in this file.
+command:
+  - "sh"
+  - "-c"
+  - "chainlit run app/main.py --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000} --headless"
+
+env:
+  - name: "AURA_CHAT_MODEL"
+    value: "databricks-claude-sonnet-4-5"
