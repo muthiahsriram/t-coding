@@ -13,7 +13,7 @@ from datetime import date
 
 from app.domain import Client
 from app.portfolio import allocation_by, goal_status, money, pct
-from app.seed import MODEL_PORTFOLIOS
+from app.seed import MODEL_ALLOCATIONS, MODEL_BUCKET
 
 # Mirrors data/kb/internal-concentration-limits.md and
 # data/kb/internal-model-portfolios.md. Duplicated as code because the review
@@ -44,11 +44,18 @@ class Fact:
 
 
 def _model_weights(client: Client) -> dict[str, float]:
-    return MODEL_PORTFOLIOS.get(client.risk_profile, {})
+    return MODEL_ALLOCATIONS.get(client.risk_profile, {})
 
 
 def drift(client: Client) -> list[Fact]:
-    """Per-instrument deviation from the client's model portfolio."""
+    """Asset-class deviation from the client's model portfolio.
+
+    Measured by asset class, not by instrument, because that is what the
+    rebalancing policy defines drift to be: "the absolute difference between
+    the actual weight of an asset class and its model weight". Measuring it
+    per-instrument would report a client who swapped one global equity tracker
+    for another as having drifted twice, when their allocation never moved.
+    """
     holdings = client.all_holdings()
     invested = sum(h.market_value for h in holdings)
     if invested <= 0:
@@ -56,26 +63,31 @@ def drift(client: Client) -> list[Fact]:
 
     actual: dict[str, float] = {}
     for holding in holdings:
-        ticker = holding.instrument.ticker
-        actual[ticker] = actual.get(ticker, 0.0) + holding.market_value / invested
+        bucket = MODEL_BUCKET.get(holding.instrument.asset_class, holding.instrument.asset_class)
+        actual[bucket] = actual.get(bucket, 0.0) + holding.market_value / invested
 
     target = _model_weights(client)
     facts = []
-    for ticker in sorted(set(actual) | set(target)):
-        gap = actual.get(ticker, 0.0) - target.get(ticker, 0.0)
-        if abs(gap) < DRIFT_REPORT:
+    for bucket in sorted(set(actual) | set(target)):
+        gap = actual.get(bucket, 0.0) - target.get(bucket, 0.0)
+        # Rounded to the precision the statement prints, for the same reason
+        # the concentration limit is: a gap that displays as "+5.0 points"
+        # must not be silently below the 5-point reporting threshold.
+        points = round(gap * 100, 1)
+        if abs(points) < DRIFT_REPORT * 100:
             continue
+        breach = abs(points) >= DRIFT_ACTION * 100
         facts.append(
             Fact(
-                key=f"drift-{ticker}",
+                key=f"drift-{bucket}",
                 topic="allocation",
                 statement=(
-                    f"{ticker} is at {pct(actual.get(ticker, 0.0))} against a "
-                    f"{client.risk_profile} model weight of {pct(target.get(ticker, 0.0))}, "
-                    f"a drift of {gap * 100:+.1f} points "
-                    f"({'action threshold 10 points exceeded' if abs(gap) >= DRIFT_ACTION else 'within the 10-point action threshold'})"
+                    f"{bucket} is at {pct(actual.get(bucket, 0.0))} against a "
+                    f"{client.risk_profile} model weight of {pct(target.get(bucket, 0.0))}, "
+                    f"a drift of {points:+.1f} points "
+                    f"({'beyond the 10-point action threshold' if breach else 'within the 10-point action threshold'})"
                 ),
-                breach=abs(gap) >= DRIFT_ACTION,
+                breach=breach,
             )
         )
     return facts
@@ -93,10 +105,19 @@ def concentration(client: Client) -> list[Fact]:
             by_ticker.get(holding.instrument.ticker, 0.0) + holding.market_value
         )
 
+    # The limit is on equity positions specifically. Applied to everything, it
+    # reports the conservative model's own 60% bond allocation as a permanent
+    # breach of the firm's policy, which is not what the policy says.
+    equities = {
+        h.instrument.ticker
+        for h in holdings
+        if MODEL_BUCKET.get(h.instrument.asset_class) == "equity"
+    }
+
     facts = []
     for ticker, value in sorted(by_ticker.items(), key=lambda kv: -kv[1]):
         weight = value / invested
-        if weight < SINGLE_NAME_WATCH:
+        if weight < SINGLE_NAME_WATCH or ticker not in equities:
             continue
         facts.append(
             Fact(

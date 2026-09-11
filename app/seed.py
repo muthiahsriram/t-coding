@@ -17,6 +17,25 @@ from app.domain import Account, Client, Goal, Holding, Liability, Property
 
 SEED = 20260101
 
+# Target asset-class weights per risk profile, mirroring the four models in
+# data/kb/internal-model-portfolios.md. This is the table drift is measured
+# against, because that is what the policy says drift means: "the absolute
+# difference between the actual weight of an asset class and its model weight".
+#
+# The policy names only equity, bonds and commodities. Listed REITs are counted
+# as equity here -- they are listed equity that happens to hold property, they
+# carry equity drawdowns, and leaving them in a fourth bucket would make every
+# model's weights fail to sum to 1.
+MODEL_ALLOCATIONS: dict[str, dict[str, float]] = {
+    "conservative": {"equity": 0.30, "bond": 0.60, "commodity": 0.10},
+    "balanced": {"equity": 0.60, "bond": 0.35, "commodity": 0.05},
+    "growth": {"equity": 0.80, "bond": 0.15, "commodity": 0.05},
+    "aggressive": {"equity": 0.95, "bond": 0.00, "commodity": 0.05},
+}
+
+# How an instrument's asset class maps onto the three buckets the models use.
+MODEL_BUCKET = {"equity": "equity", "reit": "equity", "bond": "bond", "commodity": "commodity"}
+
 # Target weights per risk profile. Weights sum to 1.0 within each profile.
 MODEL_PORTFOLIOS: dict[str, dict[str, float]] = {
     "conservative": {
@@ -124,7 +143,16 @@ def _build_accounts(rng: random.Random, profile: str, investable: float, cash: f
     withdrawal-restricted portion of net worth visibly distinct from the part
     the client can actually touch.
     """
-    weights = MODEL_PORTFOLIOS[profile]
+    # Tilt each position off its model weight before building the book. Without
+    # this every client's holdings are generated *from* the model table, so
+    # actual weight equals target weight to the last decimal and the drift
+    # facts are structurally incapable of firing -- a whole branch of the
+    # review that could never be reached. A real book drifts because prices
+    # moved; the tilt stands in for that. Seeded, so it stays reproducible.
+    tilted = {t: w * rng.uniform(0.55, 1.5) for t, w in MODEL_PORTFOLIOS[profile].items()}
+    total = sum(tilted.values())
+    weights = {t: w / total for t, w in tilted.items()}
+
     brokerage_value = investable * 0.72
     srs_value = investable * 0.10
     cpf_value = investable * 0.18

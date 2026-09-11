@@ -33,16 +33,32 @@ def test_a_position_over_the_single_name_limit_is_a_breach():
     client = get_client("C002")
     holdings = client.all_holdings()
     invested = sum(h.market_value for h in holdings)
-    largest = max(
-        (h.instrument.ticker for h in holdings),
-        key=lambda t: sum(h.market_value for h in holdings if h.instrument.ticker == t),
-    )
-    weight = sum(h.market_value for h in holdings if h.instrument.ticker == largest) / invested
+    measured = {f.key: f for f in facts.concentration(client)}
 
-    fact = next(
-        f for f in facts.concentration(client) if f.key == f"concentration-{largest}"
-    )
-    assert fact.breach == (round(weight, 4) > facts.SINGLE_NAME_LIMIT)
+    for holding in holdings:
+        ticker = holding.instrument.ticker
+        weight = sum(
+            h.market_value for h in holdings if h.instrument.ticker == ticker
+        ) / invested
+        fact = measured.get(f"concentration-{ticker}")
+        if fact is not None:
+            assert fact.breach == (round(weight, 4) > facts.SINGLE_NAME_LIMIT)
+
+
+def test_the_single_name_limit_applies_to_equities_not_bonds():
+    """Applied to everything, it reports the conservative model's own 60% bond
+    allocation as a permanent breach of the firm's policy."""
+    conservative = get_client("C004")
+    bonds = {
+        h.instrument.ticker
+        for h in conservative.all_holdings()
+        if h.instrument.asset_class == "bond"
+    }
+
+    flagged = {
+        f.key.removeprefix("concentration-") for f in facts.concentration(conservative)
+    }
+    assert bonds and not (flagged & bonds)
 
 
 def test_drift_is_measured_against_the_clients_own_model_portfolio():
@@ -51,6 +67,25 @@ def test_drift_is_measured_against_the_clients_own_model_portfolio():
     statements = " ".join(f.statement for f in facts.drift(conservative))
 
     assert "conservative model weight" in statements
+
+
+def test_drift_is_measured_by_asset_class_not_by_instrument():
+    """The rebalancing policy defines drift over asset classes. Per-instrument,
+    a client who swapped one global tracker for another drifts twice while
+    their allocation never moved."""
+    keys = {f.key for f in facts.drift(get_client("C002"))}
+
+    assert keys <= {"drift-equity", "drift-bond", "drift-commodity"}
+
+
+def test_the_book_actually_drifts():
+    """Regression guard. The seeded holdings were once generated *from* the
+    model weights, so actual equalled target to the last decimal and this whole
+    branch of the review could never fire."""
+    from app.seed import BOOK
+
+    drifting = [c for c in BOOK.values() if facts.drift(c)]
+    assert len(drifting) >= 4
 
 
 def test_every_seeded_client_produces_facts_without_raising():
@@ -121,7 +156,9 @@ class _ScriptedModel:
         self.prompts: list[list[dict]] = []
 
     async def __call__(self, messages, **kwargs):
-        self.prompts.append(messages)
+        # Copied: the retry path extends the same list in place, so holding the
+        # reference would make every recorded prompt for a stage identical.
+        self.prompts.append(list(messages))
         return self.responses.pop(0)
 
 
@@ -253,12 +290,29 @@ async def test_the_risk_stage_only_retrieves_policy_and_regulation(
 ):
     """Scoring a breach against a market commentary note is not a policy basis."""
     client = get_client("C002")
-    model = scripted(_findings_json(client), _ASSESSMENT_JSON, _RECOMMENDATION_JSON)
+    scripted(_findings_json(client), _ASSESSMENT_JSON, _RECOMMENDATION_JSON)
 
-    await pipeline.run_review(client, retriever, today=TODAY)
+    calls: list[dict] = []
+    original = retriever.search
 
-    context = model.prompts[1][1]["content"]
-    assert "commentary" not in context.lower().split("policy and regulation")[1][:400]
+    async def spy(query, **kwargs):
+        calls.append(kwargs)
+        return await original(query, **kwargs)
+
+    retriever.search = spy
+    try:
+        await pipeline.run_review(client, retriever, today=TODAY)
+    finally:
+        retriever.search = original
+
+    risk_filters = calls[0]["filters"]
+    assert risk_filters.doc_types == ("policy", "regulation")
+
+    sources = await original(
+        pipeline.RISK_QUERY, client=client, k=6, filters=risk_filters, today=TODAY
+    )
+    assert sources
+    assert all(c.meta.doc_type in ("policy", "regulation") for c in sources)
 
 
 async def test_every_stage_is_reported_for_the_trace(scripted, retriever):
@@ -292,17 +346,38 @@ async def test_the_rendered_review_shows_only_the_client_facing_stage(
 
 
 def test_the_coded_thresholds_match_the_policy_documents():
-    """facts.py duplicates the limits as code; the two must not drift apart."""
+    """facts.py restates the limits as code so the review can compute against
+    them. Nothing stops the two copies drifting apart except this test."""
     from app.rag.corpus import load_handwritten
 
-    policy = next(
-        d.text for d in load_handwritten() if d.meta.doc_id == "internal-concentration-limits"
-    )
-    assert f"{facts.SINGLE_NAME_LIMIT:.0%}".replace("%", "%") in policy
-    assert f"{facts.SECTOR_LIMIT:.0%}" in policy
-    assert f"{facts.CASH_DRAG_LIMIT:.0%}" in policy
+    kb = {d.meta.doc_id: d.text for d in load_handwritten()}
+
+    limits = kb["internal-concentration-limits"]
+    assert f"{facts.SINGLE_NAME_LIMIT:.0%}" in limits
+    assert f"{facts.SINGLE_NAME_WATCH:.0%}" in limits
+    assert f"{facts.SECTOR_LIMIT:.0%}" in limits
+    assert f"{facts.HOME_BIAS_LIMIT:.0%}" in limits
+    assert f"{facts.CASH_DRAG_LIMIT:.0%}" in limits
+
+    models = kb["internal-model-portfolios"]
+    assert f"{facts.DRIFT_REPORT * 100:.0f} percentage points" in models
+    assert f"{facts.DRIFT_ACTION * 100:.0f} points" in models
+
+
+def test_the_coded_model_allocations_match_the_policy_document():
+    """The four models are described in prose in the KB and as numbers in the
+    seed. A client rebalanced toward a model the document does not describe is
+    the worst kind of wrong: internally consistent and unjustifiable."""
+    from app.rag.corpus import load_handwritten
+    from app.seed import MODEL_ALLOCATIONS
 
     models = next(
         d.text for d in load_handwritten() if d.meta.doc_id == "internal-model-portfolios"
     )
-    assert "5 percentage points" in models and "10 points" in models
+
+    for profile, weights in MODEL_ALLOCATIONS.items():
+        sentence = next(s for s in models.split("\n") if s.startswith(f"The {profile} model"))
+        assert abs(sum(weights.values()) - 1.0) < 1e-9
+        for bucket, weight in weights.items():
+            if weight:
+                assert f"{weight:.0%}" in sentence, (profile, bucket)

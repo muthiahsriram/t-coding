@@ -65,7 +65,7 @@ def _load_client_map() -> dict[str, str]:
     users on top, so a corporate ID can be pointed at a demo client without a
     code change:
 
-        AURA_CLIENT_MAP="jane.doe@fedex.com:C002,john.roe@fedex.com:C005"
+        AURA_CLIENT_MAP="jane.doe@example.com:C002,john.roe@example.com:C005"
     """
     mapping = {client.email.lower(): cid for cid, client in BOOK.items()}
 

@@ -8,15 +8,15 @@ from app.seed import BOOK, DEFAULT_CLIENT_ID
 
 def test_wsgi_style_headers_are_read():
     """Socket.IO hands us HTTP_X_FORWARDED_EMAIL, not x-forwarded-email."""
-    environ = {"HTTP_X_FORWARDED_EMAIL": "Jane.Doe@FedEx.com", "REQUEST_METHOD": "GET"}
+    environ = {"HTTP_X_FORWARDED_EMAIL": "Jane.Doe@Example.com", "REQUEST_METHOD": "GET"}
 
-    assert identity.signed_in_email(environ) == "jane.doe@fedex.com"
+    assert identity.signed_in_email(environ) == "jane.doe@example.com"
 
 
 def test_plain_header_dicts_are_read_too():
     assert (
-        identity.signed_in_email({"x-forwarded-email": "jane.doe@fedex.com"})
-        == "jane.doe@fedex.com"
+        identity.signed_in_email({"x-forwarded-email": "jane.doe@example.com"})
+        == "jane.doe@example.com"
     )
 
 
@@ -24,10 +24,10 @@ def test_identity_headers_are_tried_most_specific_first():
     """A username is a weaker identity than an email; email must win."""
     environ = {
         "HTTP_X_FORWARDED_USER": "jdoe",
-        "HTTP_X_FORWARDED_EMAIL": "jane.doe@fedex.com",
+        "HTTP_X_FORWARDED_EMAIL": "jane.doe@example.com",
     }
 
-    assert identity.signed_in_email(environ) == "jane.doe@fedex.com"
+    assert identity.signed_in_email(environ) == "jane.doe@example.com"
 
 
 def test_no_sso_headers_yields_no_identity():
@@ -62,7 +62,7 @@ def test_sso_identity_is_used_when_no_profile_is_picked():
 
 def test_an_unknown_user_falls_back_to_the_default_client():
     """A colleague opening the app must get a working demo, not an error."""
-    environ = {"HTTP_X_FORWARDED_EMAIL": "nobody@fedex.com"}
+    environ = {"HTTP_X_FORWARDED_EMAIL": "nobody@example.com"}
 
     assert identity.resolve_client_id(environ, None) == DEFAULT_CLIENT_ID
     assert identity.resolve_client_id(None, "not a real profile") == DEFAULT_CLIENT_ID
@@ -72,11 +72,11 @@ def test_an_unknown_user_falls_back_to_the_default_client():
 
 
 def test_a_corporate_id_can_be_mapped_to_a_client_without_a_code_change(monkeypatch):
-    monkeypatch.setenv("AURA_CLIENT_MAP", "jane.doe@fedex.com:C007")
+    monkeypatch.setenv("AURA_CLIENT_MAP", "jane.doe@example.com:C007")
     reloaded = importlib.reload(identity)
 
     try:
-        environ = {"HTTP_X_FORWARDED_EMAIL": "jane.doe@fedex.com"}
+        environ = {"HTTP_X_FORWARDED_EMAIL": "jane.doe@example.com"}
         assert reloaded.resolve_client_id(environ, None) == "C007"
     finally:
         monkeypatch.delenv("AURA_CLIENT_MAP")
@@ -85,7 +85,7 @@ def test_a_corporate_id_can_be_mapped_to_a_client_without_a_code_change(monkeypa
 
 def test_a_mapping_to_an_unknown_client_fails_at_startup(monkeypatch):
     """Silently serving the wrong person's portfolio is the worse failure."""
-    monkeypatch.setenv("AURA_CLIENT_MAP", "jane.doe@fedex.com:C999")
+    monkeypatch.setenv("AURA_CLIENT_MAP", "jane.doe@example.com:C999")
 
     try:
         with pytest.raises(ValueError, match="C999"):
@@ -96,7 +96,7 @@ def test_a_mapping_to_an_unknown_client_fails_at_startup(monkeypatch):
 
 
 def test_a_malformed_mapping_entry_fails_at_startup(monkeypatch):
-    monkeypatch.setenv("AURA_CLIENT_MAP", "jane.doe@fedex.com")
+    monkeypatch.setenv("AURA_CLIENT_MAP", "jane.doe@example.com")
 
     try:
         with pytest.raises(ValueError, match="email:client_id"):

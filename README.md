@@ -41,17 +41,19 @@ resolved by `databricks-sdk`. Grant that service principal **CAN QUERY** on the
 Two independent things:
 
 - **Who is operating the app** — Databricks Apps authenticates the workspace
-  user and forwards them in `X-Forwarded-Email`. Shown in the welcome message.
+  user and forwards them in `X-Forwarded-Email`. Used to resolve a default
+  client; not displayed.
 - **Whose portfolio is on screen** — the chat-profile dropdown at the top of the
-  UI, one entry per seeded client. This wins over SSO, because access is
-  restricted to a few corporate IDs and a demo needs to switch between clients.
+  UI, one entry per seeded client. This wins over SSO, because workspace access
+  is typically restricted to a handful of IDs and a demo needs to switch freely
+  between clients.
 
 To point a real workspace ID at a seeded client (so it's the default when no
 profile is picked), set `AURA_CLIENT_MAP` in `app.yaml`:
 
 ```yaml
 - name: "AURA_CLIENT_MAP"
-  value: "jane.doe@fedex.com:C002,john.roe@fedex.com:C005"
+  value: "jane.doe@example.com:C002,john.roe@example.com:C005"
 ```
 
 An unknown ID falls back to `DEFAULT_CLIENT_ID`; a mapping to a client that

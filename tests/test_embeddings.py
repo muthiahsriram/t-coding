@@ -1,3 +1,5 @@
+import asyncio
+
 import numpy as np
 import pytest
 
@@ -7,14 +9,19 @@ from app.rag import embeddings
 class _FakeEmbeddings:
     """Stands in for ``client.embeddings``, recording what it was asked."""
 
-    def __init__(self, dimensions=4, fail_for=(), shuffle=False):
+    def __init__(self, dimensions=4, fail_for=(), shuffle=False, hang_for=()):
         self.dimensions = dimensions
         self.fail_for = fail_for
         self.shuffle = shuffle
+        self.hang_for = hang_for
         self.calls: list[tuple[str, list[str]]] = []
+        self.timeouts: list[float | None] = []
 
-    async def create(self, *, model, input):
+    async def create(self, *, model, input, timeout=None):
         self.calls.append((model, list(input)))
+        self.timeouts.append(timeout)
+        if model in self.hang_for:
+            await asyncio.sleep(3600)
         if model in self.fail_for:
             raise RuntimeError(f"endpoint {model} does not exist")
 
@@ -27,11 +34,28 @@ class _FakeEmbeddings:
         return type("Response", (), {"data": data})
 
 
+class _FakeClient:
+    """Stands in for the AsyncOpenAI client.
+
+    ``with_options`` matters: the probe uses it to disable retries, and a
+    double without it silently turned every probe into a failure.
+    """
+
+    def __init__(self, stub: _FakeEmbeddings):
+        self.embeddings = stub
+        self.options: list[dict] = []
+
+    def with_options(self, **kwargs):
+        self.options.append(kwargs)
+        return self
+
+
 @pytest.fixture
 def fake_client(monkeypatch):
     def install(**kwargs):
         stub = _FakeEmbeddings(**kwargs)
-        client = type("Client", (), {"embeddings": stub})
+        client = _FakeClient(stub)
+        stub.client = client
         monkeypatch.setattr(embeddings, "get_client", lambda: client)
         return stub
 
@@ -154,3 +178,52 @@ async def test_an_explicitly_configured_endpoint_is_not_probed(
 
     assert embedder is not None and embedder.model == "my-endpoint"
     assert stub.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_probe_is_bounded_and_does_not_retry(fake_client, monkeypatch):
+    """The shared client is tuned for generation: 180s and three retries. Used
+    unchanged for a liveness check, two dead candidates would stall the app's
+    first message for twenty minutes."""
+    monkeypatch.setattr(embeddings, "EMBED_MODEL", "")
+    stub = fake_client()
+
+    assert await embeddings.probe("m", timeout=5.0)
+
+    assert stub.timeouts == [5.0]
+    assert stub.client.options == [{"max_retries": 0}]
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_endpoint_is_abandoned_rather_than_waited_on(
+    fake_client, monkeypatch
+):
+    """Credential resolution on this workspace has blocked indefinitely before,
+    somewhere the HTTP timeout does not reach."""
+    monkeypatch.setattr(embeddings, "EMBED_MODEL", "")
+    fake_client(hang_for=("slow",))
+
+    assert await embeddings.probe("slow", timeout=0.05) is False
+
+
+@pytest.mark.asyncio
+async def test_resolution_moves_past_a_hanging_candidate(fake_client, monkeypatch):
+    monkeypatch.setattr(embeddings, "EMBED_MODEL", "")
+    monkeypatch.setattr(embeddings, "PROBE_TIMEOUT", 0.05)
+    fake_client(hang_for=("slow",))
+
+    embedder = await embeddings.resolve_embedder(("slow", "live"))
+
+    assert embedder is not None and embedder.model == "live"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_embedding_is_not_capped_by_the_probe_timeout(fake_client):
+    """Indexing a thousand chunks is a long job and must keep the generous
+    client defaults; only the probe is impatient."""
+    stub = fake_client()
+
+    await embeddings.DatabricksEmbedder("m").embed(["a"])
+
+    assert stub.timeouts == [None]
+    assert stub.client.options == []

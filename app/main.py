@@ -50,6 +50,28 @@ async def get_retriever() -> Retriever:
     return _retriever
 
 
+def warm_retriever() -> None:
+    """Start building the index without waiting for it.
+
+    Embedding the corpus is ~35 sequential round trips. Left until the first
+    question, that is a silent half-minute stall on the very first thing the
+    user types, which reads as a hung app. Started here, it runs while they are
+    still reading the welcome message.
+    """
+
+    async def warm() -> None:
+        try:
+            await get_retriever()
+        except Exception:
+            # Logged, not raised: an unawaited task that throws would surface
+            # as an unhandled exception warning and nothing else. The next
+            # caller retries, and retrieval failure degrades the answer rather
+            # than breaking the chat.
+            log.exception("background retriever warm-up failed")
+
+    asyncio.create_task(warm())
+
+
 @cl.set_chat_profiles
 async def chat_profiles(current_user=None, language=None):
     """One profile per client, so a demo can switch portfolios in the UI."""
@@ -91,6 +113,7 @@ async def on_chat_start() -> None:
         "conversation",
         Conversation(system_prompt=prompts.client_advisor(summarise(client))),
     )
+    warm_retriever()
 
     await cl.Message(
         content=(
@@ -129,14 +152,23 @@ async def _answer(client, question: str) -> None:
     retriever = await get_retriever()
 
     async with cl.Step(name="Retrieval", type="retrieval") as step:
-        chunks = await retriever.search(question, client=client, k=4)
-        step.output = (
-            "\n".join(
-                f"**S{i}** {c.meta.title} — score {c.scores['reranked']:.3f}"
-                for i, c in enumerate(chunks, start=1)
+        try:
+            chunks = await retriever.search(question, client=client, k=4)
+        except Exception:
+            # An unanswerable question is a worse outcome than an ungrounded
+            # one. Fall through to the model with no sources attached, and say
+            # in the trace that this is what happened.
+            log.exception("retrieval failed; answering without sources")
+            chunks = []
+            step.output = "Retrieval failed; answering without sources."
+        else:
+            step.output = (
+                "\n".join(
+                    f"**S{i}** {c.meta.title} — score {c.scores['reranked']:.3f}"
+                    for i, c in enumerate(chunks, start=1)
+                )
+                or "No sources matched."
             )
-            or "No sources matched."
-        )
 
     payload = conversation.to_payload()
     if chunks:

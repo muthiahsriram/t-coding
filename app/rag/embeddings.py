@@ -42,12 +42,28 @@ def _normalise(vectors: np.ndarray) -> np.ndarray:
     return vectors / np.where(norms == 0, 1.0, norms)
 
 
+# A probe must fail fast. The shared chat client is configured for generation:
+# a 180s timeout with three retries, which is right for a long completion and
+# catastrophic for a liveness check -- two dead candidates would stall the
+# first message for twenty minutes behind what is meant to be a quick question.
+PROBE_TIMEOUT = 15.0
+
+
 class DatabricksEmbedder:
     """Embeds text through one named Databricks serving endpoint."""
 
-    def __init__(self, model: str, *, batch_size: int = EMBED_BATCH):
+    def __init__(
+        self,
+        model: str,
+        *,
+        batch_size: int = EMBED_BATCH,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+    ):
         self.model = model
         self.batch_size = batch_size
+        self.timeout = timeout
+        self.max_retries = max_retries
         self._dimensions: int | None = None
 
     @property
@@ -68,6 +84,10 @@ class DatabricksEmbedder:
         payload = [prefix + text for text in texts]
 
         client = get_client()
+        if self.max_retries is not None:
+            client = client.with_options(max_retries=self.max_retries)
+        options = {"timeout": self.timeout} if self.timeout is not None else {}
+
         batches = [
             payload[i : i + self.batch_size]
             for i in range(0, len(payload), self.batch_size)
@@ -77,7 +97,9 @@ class DatabricksEmbedder:
         # build time is how you get rate-limited off your own endpoint.
         rows: list[list[float]] = []
         for batch in batches:
-            response = await client.embeddings.create(model=self.model, input=batch)
+            response = await client.embeddings.create(
+                model=self.model, input=batch, **options
+            )
             # The endpoint is not contractually obliged to preserve input order.
             for item in sorted(response.data, key=lambda d: d.index):
                 rows.append(item.embedding)
@@ -91,10 +113,23 @@ class DatabricksEmbedder:
         return (await self.embed([text], kind="query"))[0]
 
 
-async def probe(model: str) -> bool:
-    """True if ``model`` is a live embedding endpoint we may call."""
+async def probe(model: str, *, timeout: float | None = None) -> bool:
+    """True if ``model`` is a live embedding endpoint we may call.
+
+    Bounded twice over: once through the request timeout, and once with
+    ``wait_for`` in case the hang is somewhere the HTTP timeout does not reach
+    -- credential resolution on this workspace has blocked indefinitely before.
+    """
+    # Read at call time, not bound as a default: a module-level default is
+    # captured at import and silently ignores anything that tunes the constant
+    # afterwards, which is exactly the kind of knob that looks like it works.
+    timeout = PROBE_TIMEOUT if timeout is None else timeout
+    embedder = DatabricksEmbedder(model, timeout=timeout, max_retries=0)
     try:
-        await DatabricksEmbedder(model).embed(["probe"])
+        await asyncio.wait_for(embedder.embed(["probe"]), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.info("embedding endpoint %s did not answer within %.0fs", model, timeout)
+        return False
     except Exception as exc:  # endpoint missing, no permission, wrong task type
         log.info("embedding endpoint %s unavailable: %s", model, exc)
         return False
