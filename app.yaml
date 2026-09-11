@@ -4,11 +4,19 @@
 # are injected as an OAuth service principal (DATABRICKS_CLIENT_ID /
 # DATABRICKS_CLIENT_SECRET) and picked up automatically by databricks-sdk —
 # no token belongs in this file.
+# Invoked as `python -m chainlit`, not the `chainlit` console script: `-m` puts
+# the working directory on sys.path, which is what makes `from app.x import y`
+# resolve. The console script instead puts its own bin/ directory there, and
+# the app fails at import with ModuleNotFoundError: No module named 'app'.
 command:
   - "sh"
   - "-c"
-  - "chainlit run app/main.py --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000} --headless"
+  - "python -m chainlit run app/main.py --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000} --headless"
 
 env:
   - name: "AURA_CHAT_MODEL"
     value: "databricks-claude-sonnet-4-5"
+  # Belt and braces alongside `-m`, in case the app is started from a
+  # different working directory.
+  - name: "PYTHONPATH"
+    value: "."
